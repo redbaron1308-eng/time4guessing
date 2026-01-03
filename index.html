@@ -1,0 +1,453 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from 'firebase/auth';
+import { 
+  getFirestore, 
+  doc, 
+  setDoc, 
+  onSnapshot, 
+  updateDoc, 
+  arrayUnion, 
+  collection 
+} from 'firebase/firestore';
+import { Users, Play, Clock, SkipForward, RotateCcw, Copy, CheckCircle2, UserPlus, Trophy, hash } from 'lucide-react';
+
+// Configuration Firebase
+const firebaseConfig = JSON.parse(__firebase_config);
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'times-up-game';
+
+const GAME_STATES = {
+  LOBBY: 'LOBBY',
+  PLAYING: 'PLAYING',
+  ROUND_END: 'ROUND_END',
+  GAME_OVER: 'GAME_OVER'
+};
+
+const ROUNDS = [
+  { id: 1, name: "Manche 1 : Parole Libre", description: "On peut dire n'importe quoi pour faire deviner le mot !" },
+  { id: 2, name: "Manche 2 : Un seul mot", description: "Un seul mot autorisé par carte. Réfléchissez bien !" },
+  { id: 3, name: "Manche 3 : Le Mime", description: "Silence complet. Seul le corps parle !" }
+];
+
+export default function App() {
+  const [user, setUser] = useState(null);
+  const [roomData, setRoomData] = useState(null);
+  const [roomId, setRoomId] = useState("");
+  const [inputRoomId, setInputRoomId] = useState("");
+  const [myWord, setMyWord] = useState("");
+  const [timer, setTimer] = useState(30);
+  const [isTimerRunning, setIsTimerRunning] = useState(false);
+  const [copyFeedback, setCopyFeedback] = useState(false);
+
+  // 1. Initialisation Auth
+  useEffect(() => {
+    const initAuth = async () => {
+      try {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+          await signInAnonymously(auth);
+        }
+      } catch (err) {
+        console.error("Auth Error", err);
+      }
+    };
+    initAuth();
+    
+    const unsubscribe = onAuthStateChanged(auth, (u) => {
+      setUser(u);
+    });
+    return () => unsubscribe();
+  }, []);
+
+  // 2. Gestion de l'URL initiale (uniquement au chargement)
+  useEffect(() => {
+    const urlParams = new URLSearchParams(window.location.search);
+    const roomFromUrl = urlParams.get('room');
+    if (roomFromUrl) {
+      setRoomId(roomFromUrl.toUpperCase());
+    }
+  }, []);
+
+  // 3. Écouteur Firestore
+  useEffect(() => {
+    if (!user || !roomId) return;
+
+    const roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', roomId);
+    
+    const unsubscribe = onSnapshot(roomRef, (docSnap) => {
+      if (docSnap.exists()) {
+        const data = docSnap.data();
+        setRoomData(data);
+        
+        // Ajouter le joueur s'il n'y est pas
+        if (!data.players.find(p => p.id === user.uid)) {
+          updateDoc(roomRef, {
+            players: arrayUnion({ id: user.uid, name: `Joueur ${data.players.length + 1}`, score: 0 })
+          }).catch(e => console.error("Error updating players:", e));
+        }
+      }
+    }, (err) => {
+      console.error("Firestore Error:", err);
+    });
+
+    return () => unsubscribe();
+  }, [user, roomId]);
+
+  // 4. Logique du Timer
+  useEffect(() => {
+    let interval;
+    if (isTimerRunning && timer > 0) {
+      interval = setInterval(() => setTimer(t => t - 1), 1000);
+    } else if (timer === 0) {
+      setIsTimerRunning(false);
+      handleEndOfTurn();
+    }
+    return () => clearInterval(interval);
+  }, [isTimerRunning, timer]);
+
+  const createRoom = async () => {
+    if (!user) return;
+    // Générer un code court et lisible (ex: AB12)
+    const newRoomId = Math.random().toString(36).substring(2, 6).toUpperCase();
+    const roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', newRoomId);
+    
+    const initialData = {
+      id: newRoomId,
+      status: GAME_STATES.LOBBY,
+      players: [{ id: user.uid, name: "Hôte", score: 0 }],
+      words: [],
+      currentRound: 0,
+      activeDeck: [],
+      currentPlayerIndex: 0,
+      currentWordIndex: 0,
+      scores: { team1: 0, team2: 0 },
+      lastUpdated: Date.now()
+    };
+
+    try {
+      await setDoc(roomRef, initialData);
+      setRoomId(newRoomId);
+    } catch (e) {
+      console.error("Error creating room:", e);
+    }
+  };
+
+  const joinRoom = () => {
+    if (inputRoomId.trim()) {
+      setRoomId(inputRoomId.trim().toUpperCase());
+    }
+  };
+
+  const copyLink = () => {
+    const url = new URL(window.location.href.split('?')[0]);
+    url.searchParams.set('room', roomId);
+    
+    const textToCopy = `Rejoins ma partie Time's Up !\nCode du salon : ${roomId}\nLien : ${url.toString()}`;
+    
+    const el = document.createElement('textarea');
+    el.value = textToCopy;
+    document.body.appendChild(el);
+    el.select();
+    document.execCommand('copy');
+    document.body.removeChild(el);
+    setCopyFeedback(true);
+    setTimeout(() => setCopyFeedback(false), 2000);
+  };
+
+  const addWord = async () => {
+    if (!myWord.trim() || !user) return;
+    const roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', roomId);
+    await updateDoc(roomRef, {
+      words: arrayUnion({ text: myWord.trim(), creator: user.uid })
+    });
+    setMyWord("");
+  };
+
+  const startGame = async () => {
+    if (!user) return;
+    const roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', roomId);
+    const shuffledWords = [...roomData.words].sort(() => Math.random() - 0.5);
+    await updateDoc(roomRef, {
+      status: GAME_STATES.PLAYING,
+      currentRound: 0,
+      activeDeck: shuffledWords,
+      currentWordIndex: 0,
+      currentPlayerIndex: 0
+    });
+  };
+
+  const nextWord = async (found) => {
+    if (!user) return;
+    const roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', roomId);
+    let newWordIndex = roomData.currentWordIndex + 1;
+    let newScores = { ...roomData.scores };
+    
+    const team = roomData.currentPlayerIndex % 2 === 0 ? 'team1' : 'team2';
+    if (found) newScores[team] += 1;
+
+    if (newWordIndex >= roomData.activeDeck.length) {
+      const nextRound = roomData.currentRound + 1;
+      if (nextRound >= 3) {
+        await updateDoc(roomRef, { status: GAME_STATES.GAME_OVER, scores: newScores });
+      } else {
+        await updateDoc(roomRef, {
+          status: GAME_STATES.ROUND_END,
+          currentRound: nextRound,
+          scores: newScores,
+          activeDeck: [...roomData.words].sort(() => Math.random() - 0.5),
+          currentWordIndex: 0
+        });
+      }
+      setIsTimerRunning(false);
+    } else {
+      await updateDoc(roomRef, {
+        currentWordIndex: newWordIndex,
+        scores: newScores
+      });
+    }
+  };
+
+  const handleEndOfTurn = async () => {
+    if (!user) return;
+    const roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', roomId);
+    const nextPlayer = (roomData.currentPlayerIndex + 1) % roomData.players.length;
+    await updateDoc(roomRef, {
+      currentPlayerIndex: nextPlayer
+    });
+    setTimer(30);
+  };
+
+  const startTurn = () => {
+    setTimer(30);
+    setIsTimerRunning(true);
+  };
+
+  if (!user) {
+    return (
+      <div className="min-h-screen bg-indigo-900 flex items-center justify-center text-white">
+        Initialisation...
+      </div>
+    );
+  }
+
+  // Écran d'accueil
+  if (!roomId) {
+    return (
+      <div className="min-h-screen bg-indigo-900 flex flex-col items-center justify-center p-4 text-white font-sans">
+        <div className="max-w-md w-full text-center space-y-8 bg-white/10 p-8 rounded-3xl backdrop-blur-lg border border-white/20 shadow-2xl">
+          <h1 className="text-5xl font-black tracking-tighter italic">TIME'S UP!</h1>
+          
+          <div className="space-y-4">
+            <button 
+              onClick={createRoom}
+              className="w-full py-4 bg-yellow-400 hover:bg-yellow-300 text-indigo-900 font-bold rounded-xl transition-all shadow-lg flex items-center justify-center gap-2 text-xl"
+            >
+              <Play fill="currentColor" /> CRÉER UN SALON
+            </button>
+            
+            <div className="relative flex items-center py-2">
+              <div className="flex-grow border-t border-white/20"></div>
+              <span className="flex-shrink mx-4 text-white/40 text-sm font-bold uppercase">OU</span>
+              <div className="flex-grow border-t border-white/20"></div>
+            </div>
+
+            <div className="space-y-2">
+              <input 
+                type="text"
+                placeholder="Entrer le code (ex: AB12)"
+                value={inputRoomId}
+                onChange={(e) => setInputRoomId(e.target.value.toUpperCase())}
+                className="w-full px-4 py-3 rounded-xl bg-white/5 border border-white/20 focus:border-yellow-400 outline-none text-center text-xl font-mono"
+              />
+              <button 
+                onClick={joinRoom}
+                className="w-full py-3 bg-white/10 hover:bg-white/20 text-white font-bold rounded-xl transition-all flex items-center justify-center gap-2"
+              >
+                REJOINDRE
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (!roomData) return <div className="min-h-screen bg-indigo-900 flex flex-col items-center justify-center text-white gap-4">
+    <div className="animate-spin rounded-full h-12 w-12 border-4 border-yellow-400 border-t-transparent"></div>
+    <div className="font-bold">Recherche du salon {roomId}...</div>
+    <button onClick={() => setRoomId("")} className="text-sm underline opacity-50">Annuler</button>
+  </div>;
+
+  const isMyTurn = roomData.players[roomData.currentPlayerIndex]?.id === user?.uid;
+
+  return (
+    <div className="min-h-screen bg-slate-50 text-slate-900 font-sans pb-10">
+      <header className="bg-indigo-600 text-white p-4 shadow-lg sticky top-0 z-10">
+        <div className="max-w-4xl mx-auto flex justify-between items-center">
+          <div className="flex flex-col">
+            <h1 className="text-xl font-black italic leading-none">TIME'S UP!</h1>
+            <span className="text-[10px] font-bold opacity-70 tracking-widest uppercase">Code: {roomId}</span>
+          </div>
+          <div className="flex items-center gap-3">
+            <div className="hidden sm:flex gap-2">
+              <span className="bg-white/20 px-3 py-1 rounded-full text-xs font-bold">A: {roomData.scores.team1}</span>
+              <span className="bg-white/20 px-3 py-1 rounded-full text-xs font-bold">B: {roomData.scores.team2}</span>
+            </div>
+            <button onClick={copyLink} className="px-3 py-2 hover:bg-white/10 rounded-lg transition-colors flex items-center gap-2 text-xs font-bold bg-indigo-500 border border-indigo-400">
+              {copyFeedback ? <CheckCircle2 size={14} className="text-green-300" /> : <Copy size={14} />}
+              {copyFeedback ? "Copié !" : "Inviter"}
+            </button>
+          </div>
+        </div>
+      </header>
+
+      <main className="max-w-4xl mx-auto mt-6 px-4">
+        {roomData.status === GAME_STATES.LOBBY && (
+          <div className="grid md:grid-cols-2 gap-6">
+            <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-200">
+              <div className="flex justify-between items-center mb-4">
+                <h2 className="text-lg font-bold flex items-center gap-2"><Users className="text-indigo-600" /> Joueurs ({roomData.players.length})</h2>
+                <span className="text-xs font-mono bg-slate-100 px-2 py-1 rounded text-slate-500">SALON: {roomId}</span>
+              </div>
+              <div className="space-y-2">
+                {roomData.players.map((p, i) => (
+                  <div key={i} className="flex items-center gap-3 p-3 bg-slate-50 rounded-xl border border-slate-100">
+                    <div className={`w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold ${i % 2 === 0 ? 'bg-indigo-100 text-indigo-600' : 'bg-rose-100 text-rose-600'}`}>
+                      {i % 2 === 0 ? 'A' : 'B'}
+                    </div>
+                    <span className="font-medium text-sm">{p.name}</span>
+                    {p.id === user?.uid && <span className="text-[9px] bg-slate-200 px-2 py-0.5 rounded-full uppercase font-bold">Moi</span>}
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-200">
+              <h2 className="text-lg font-bold mb-4">Ajouter des mots</h2>
+              <div className="flex gap-2 mb-4">
+                <input 
+                  type="text" 
+                  value={myWord}
+                  onChange={(e) => setMyWord(e.target.value)}
+                  placeholder="Ex: Napoléon..."
+                  className="flex-1 px-4 py-2 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-500 text-sm"
+                  onKeyPress={(e) => e.key === 'Enter' && addWord()}
+                />
+                <button onClick={addWord} className="bg-indigo-600 text-white px-4 py-2 rounded-xl font-bold hover:bg-indigo-700 transition-colors text-sm">OK</button>
+              </div>
+              <p className="text-xs text-slate-400 mb-6 italic">Tout le monde doit ajouter des mots pour commencer.</p>
+              
+              <div className="flex justify-between items-center mb-6">
+                <span className="text-sm font-medium">Mots total : <span className="text-indigo-600 font-bold">{roomData.words.length}</span></span>
+              </div>
+
+              {roomData.words.length >= 2 && roomData.players.length >= 2 ? (
+                <button onClick={startGame} className="w-full py-4 bg-green-500 hover:bg-green-600 text-white font-bold rounded-xl shadow-lg transition-transform hover:scale-[1.02]">LANCER LA PARTIE</button>
+              ) : (
+                <div className="text-center p-4 bg-slate-50 rounded-xl text-slate-400 text-xs font-medium border border-dashed border-slate-200">
+                  Besoin d'au moins 2 joueurs et 2 mots
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {roomData.status === GAME_STATES.PLAYING && (
+          <div className="max-w-2xl mx-auto space-y-4">
+            <div className="text-center bg-indigo-50 py-3 px-4 rounded-xl border border-indigo-100">
+              <h2 className="text-xl font-black text-indigo-900 uppercase tracking-tight">{ROUNDS[roomData.currentRound].name}</h2>
+              <p className="text-indigo-600 text-xs">{ROUNDS[roomData.currentRound].description}</p>
+            </div>
+
+            <div className="bg-white p-8 rounded-[2rem] shadow-xl border-2 border-slate-100 text-center relative overflow-hidden">
+              <div className="absolute top-0 left-0 h-1 bg-indigo-600 transition-all duration-1000" style={{ width: `${(timer / 30) * 100}%` }}></div>
+              <div className="mb-6">
+                <div className="text-slate-400 text-[10px] uppercase font-bold tracking-widest mb-1">Tour de</div>
+                <div className="text-xl font-bold text-indigo-600">{roomData.players[roomData.currentPlayerIndex]?.name}</div>
+              </div>
+
+              {!isTimerRunning ? (
+                <div className="py-8">
+                  <div className="text-4xl font-black mb-6 text-slate-200">Prêt ?</div>
+                  {isMyTurn ? (
+                    <button onClick={startTurn} className="px-10 py-4 bg-indigo-600 text-white rounded-xl font-bold text-xl shadow-lg hover:bg-indigo-700 transition-all transform hover:scale-105 flex items-center gap-3 mx-auto">
+                      <Play fill="white" size={20} /> COMMENCER
+                    </button>
+                  ) : (
+                    <div className="flex flex-col items-center gap-2">
+                      <div className="animate-spin rounded-full h-6 w-6 border-2 border-indigo-600 border-t-transparent"></div>
+                      <div className="text-indigo-400 font-bold text-sm">Attente du joueur...</div>
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div className="space-y-6 animate-in zoom-in duration-300">
+                  <div className="flex justify-center items-center gap-3 text-3xl font-mono font-black text-slate-800">
+                    <Clock size={28} className={timer <= 5 ? "text-red-500 animate-bounce" : "text-slate-400"} />
+                    <span className={timer <= 5 ? "text-red-500" : ""}>{timer}s</span>
+                  </div>
+                  <div className="min-h-[140px] flex items-center justify-center bg-slate-50 rounded-2xl border border-slate-100">
+                    {isMyTurn ? (
+                      <div className="text-5xl font-black text-slate-900 tracking-tight px-4 break-words uppercase">
+                        {roomData.activeDeck[roomData.currentWordIndex]?.text}
+                      </div>
+                    ) : (
+                      <div className="text-2xl font-bold text-slate-200 italic">MOT CACHÉ</div>
+                    )}
+                  </div>
+                  {isMyTurn && (
+                    <div className="flex gap-3 pt-4">
+                      <button onClick={() => nextWord(false)} className="flex-1 py-4 border-2 border-slate-200 text-slate-500 font-bold rounded-xl hover:bg-slate-50 flex items-center justify-center gap-2 text-sm uppercase tracking-wider"><SkipForward size={18} /> Passer</button>
+                      <button onClick={() => nextWord(true)} className="flex-[2] py-4 bg-green-500 text-white font-bold rounded-xl hover:bg-green-600 shadow-lg flex items-center justify-center gap-2 text-lg uppercase tracking-wider"><CheckCircle2 size={22} /> Trouvé !</button>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+            <div className="text-center text-slate-400 text-[10px] font-bold uppercase tracking-widest">Mot {roomData.currentWordIndex + 1} / {roomData.activeDeck.length}</div>
+          </div>
+        )}
+
+        {roomData.status === GAME_STATES.ROUND_END && (
+          <div className="max-w-md mx-auto bg-white p-8 rounded-2xl shadow-xl text-center border border-slate-200">
+            <h2 className="text-2xl font-black mb-2 uppercase tracking-tight text-indigo-900">Manche Terminée !</h2>
+            <div className="grid grid-cols-2 gap-4 my-8">
+              <div className="bg-indigo-50 p-4 rounded-xl border border-indigo-100">
+                <div className="text-[10px] text-indigo-400 font-black uppercase tracking-widest">Équipe A</div>
+                <div className="text-3xl font-black text-indigo-900">{roomData.scores.team1}</div>
+              </div>
+              <div className="bg-rose-50 p-4 rounded-xl border border-rose-100">
+                <div className="text-[10px] text-rose-400 font-black uppercase tracking-widest">Équipe B</div>
+                <div className="text-3xl font-black text-rose-900">{roomData.scores.team2}</div>
+              </div>
+            </div>
+            <button onClick={() => updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'rooms', roomId), { status: GAME_STATES.PLAYING })} className="w-full py-4 bg-indigo-600 text-white font-bold rounded-xl hover:bg-indigo-700 shadow-lg transition-transform hover:scale-[1.02] uppercase tracking-wider">Passer à la suite</button>
+          </div>
+        )}
+
+        {roomData.status === GAME_STATES.GAME_OVER && (
+          <div className="max-w-md mx-auto bg-white p-10 rounded-[2.5rem] shadow-2xl text-center border border-slate-200">
+            <Trophy size={60} className="mx-auto text-yellow-400 mb-6 drop-shadow-md" />
+            <h2 className="text-3xl font-black mb-10 italic uppercase tracking-tighter text-indigo-900">Résultat Final</h2>
+            <div className="space-y-4 mb-10">
+              <div className={`p-5 rounded-2xl flex justify-between items-center ${roomData.scores.team1 >= roomData.scores.team2 ? 'bg-indigo-600 text-white shadow-xl scale-105' : 'bg-slate-50 text-slate-400 opacity-60'}`}>
+                <span className="font-black text-lg uppercase italic">Équipe A</span>
+                <span className="text-3xl font-black">{roomData.scores.team1}</span>
+              </div>
+              <div className={`p-5 rounded-2xl flex justify-between items-center ${roomData.scores.team2 > roomData.scores.team1 ? 'bg-rose-500 text-white shadow-xl scale-105' : 'bg-slate-50 text-slate-400 opacity-60'}`}>
+                <span className="font-black text-lg uppercase italic">Équipe B</span>
+                <span className="text-3xl font-black">{roomData.scores.team2}</span>
+              </div>
+            </div>
+            <button onClick={() => setRoomId("")} className="w-full py-4 bg-slate-900 text-white font-bold rounded-xl flex items-center justify-center gap-2 hover:bg-black transition-colors uppercase tracking-widest text-xs"><RotateCcw size={16} /> Retour au menu</button>
+          </div>
+        )}
+      </main>
+      <footer className="mt-12 text-center text-slate-400 text-[10px] font-bold uppercase tracking-[0.2em] px-4">Time's Up Online — Collaboration & Rapidité</footer>
+    </div>
+  );
+}
